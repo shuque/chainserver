@@ -355,8 +355,10 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
 	cp += g->size;
     }
 
+#if 0
     fprintf(stdout, "\nDEBUG (REMOVE ME) chaindata:\n%s\n\n", 
 	    bindata2hexstring(chaindata));
+#endif
 
     return chaindata;
 }
