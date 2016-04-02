@@ -4,7 +4,6 @@
  * Program to send and process proposed TLS DNSSEC chain extension.
  * Falls back to PKIX authentication if no chain response from server.
  *
- * Author: Shumon Huque <shuque@gmail.com>
  */
 
 #include <stdio.h>
@@ -22,6 +21,10 @@
 
 #include <ldns/ldns.h>
 
+#include <getdns/getdns.h>
+#include <getdns/getdns_extra.h>
+#include <getdns/getdns_ext_libevent.h>
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
@@ -29,6 +32,10 @@
 #include "utils.h"
 #include "query-ldns.h"
 #include "starttls.h"
+
+
+#define MYBUFSIZE 2048
+
 
 /*
  * Enumerated Types and Global variables
@@ -117,49 +124,77 @@ int parse_options(const char *progname, int argc, char **argv)
 
 /*
  * print_cert_chain()
+ * Print contents of given certificate chain.
+ * Only DN common names of each cert + subjectaltname DNS names of end entity.
  */
 
-void print_cert_chain(SSL *ssl)
+void print_cert_chain(STACK_OF(X509) *chain)
 {
-    int i;
+    int i, rc;
     char buffer[1024];
-    int pubkey_nid;
-    const char *pubkey_buf;
-    X509 *cert;
-    STACK_OF(X509) *chain = SSL_get_peer_cert_chain(ssl);
     STACK_OF(GENERAL_NAME) *subjectaltnames = NULL;
 
-    fprintf(stdout, "Certificate chain:\n");
-    for (i = 0; i < sk_X509_num(chain); i++) {
-	cert = sk_X509_value(chain, i);
-        X509_NAME_get_text_by_NID(X509_get_subject_name(cert), NID_commonName, 
-				  buffer, sizeof buffer);
-        fprintf(stdout, "%2d Subject: %s\n", i, buffer);
-        X509_NAME_get_text_by_NID(X509_get_issuer_name(cert), NID_commonName, 
-				  buffer, sizeof buffer);
-        fprintf(stdout, "   Issuer : %s\n", buffer);
-	/*
-	pubkey_nid = OBJ_obj2nid(cert->cert_info->key->algor->algorithm);
-	const char* sslbuf = OBJ_nid2ln(pubkey_nid);
-	*/
+    if (chain == NULL) {
+	fprintf(stdout, "No Certificate Chain.");
+	return;
     }
 
-    subjectaltnames = X509_get_ext_d2i(
-				       (X509 *) sk_X509_value(chain, 0), 
-				       NID_subject_alt_name, NULL, NULL);
+    for (i = 0; i < sk_X509_num(chain); i++) {
+	rc = X509_NAME_get_text_by_NID(X509_get_subject_name(sk_X509_value(chain, i)),
+				  NID_commonName, buffer, sizeof buffer);
+	fprintf(stdout, "%2d Subject CN: %s\n", i, (rc >=0 ? buffer: "(None)"));
+	rc = X509_NAME_get_text_by_NID(X509_get_issuer_name(sk_X509_value(chain, i)),
+				  NID_commonName, buffer, sizeof buffer);
+	fprintf(stdout, "   Issuer  CN: %s\n", (rc >= 0 ? buffer: "(None)"));
+    }
 
+    subjectaltnames = X509_get_ext_d2i(sk_X509_value(chain, 0),
+                                       NID_subject_alt_name, NULL, NULL);
     if (subjectaltnames) {
-	int san_count = sk_GENERAL_NAME_num(subjectaltnames);
-	for (i = 0; i < san_count; i++) {
-	    const GENERAL_NAME *name = sk_GENERAL_NAME_value(subjectaltnames, i);
-	    if (name->type == GEN_DNS) {
-		char *dns_name = (char *) ASN1_STRING_data(name->d.dNSName);
-		fprintf(stdout, " SAN dNSName: %s\n", dns_name);
-	    }
-	}
+        int san_count = sk_GENERAL_NAME_num(subjectaltnames);
+        for (i = 0; i < san_count; i++) {
+            const GENERAL_NAME *name = sk_GENERAL_NAME_value(subjectaltnames, i);
+            if (name->type == GEN_DNS) {
+                char *dns_name = (char *) ASN1_STRING_data(name->d.dNSName);
+                fprintf(stdout, " SAN dNSName: %s\n", dns_name);
+            }
+        }
     }
 
     /* TODO: how to free stack of certs? */
+    return;
+}
+
+/*
+ * print_peer_cert_chain()
+ * Note: this prints the certificate chain presented by the server
+ * in its Certificate handshake message, not the certificate chain
+ * that was used to validate the server.
+ */
+
+void print_peer_cert_chain(SSL *ssl)
+{
+    STACK_OF(X509) *chain = SSL_get_peer_cert_chain(ssl);
+    fprintf(stdout, "Peer Certificate chain:\n");
+    print_cert_chain(chain);
+    return;
+}
+
+
+/*
+ * print_validated_chain()
+ * Prints the verified certificate chain of the peer including the peer's 
+ * end entity certificate, using SSL_get0_verified_chain(). Must be called
+ * after a session has been successfully established. If peer verification
+ * was not successful (as indicated by SSL_get_verify_result() not
+ * returning X509_V_OK) the chain may be incomplete or invalid.
+ */
+
+void print_validated_chain(SSL *ssl)
+{
+    STACK_OF(X509) *chain = SSL_get0_verified_chain(ssl);
+    fprintf(stdout, "Validated Certificate chain:\n");
+    print_cert_chain(chain);
     return;
 }
 
@@ -180,6 +215,13 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
 				 int *al, void *arg)
 {
     char *cp;
+    getdns_list *support_rrs = getdns_list_create();
+    getdns_dict *rr_dict;
+    getdns_return_t rc;
+    size_t buf_len, n_rrs;
+    uint32_t rrtype;
+    getdns_bindata *rrname = NULL;
+    char *fqdn;
 
     UNUSED_PARAM(ssl);
     UNUSED_PARAM(al);
@@ -197,7 +239,31 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     }
 
     /* TODO: process and authenticate chain data here */
-
+    n_rrs = 0;
+    buf_len = ext_len;
+    while (buf_len > 0) {
+	rc = getdns_wire2rr_dict_scan(&dnssec_chain_data, &buf_len, &rr_dict);
+	if (rc)
+	    break;
+	if ((rc = getdns_dict_get_bindata(rr_dict, "/name", &rrname))) {
+	    fprintf(stderr, "FAIL: getting rrname: %s\n",
+		    getdns_get_errorstr_by_id(rc));
+	    break;
+	}
+	getdns_convert_dns_name_to_fqdn(rrname, &fqdn);
+	if ((rc = getdns_dict_get_int(rr_dict, "/type", &rrtype))) {
+	    fprintf(stderr, "FAIL: getting rrtype: %s\n",
+		    getdns_get_errorstr_by_id(rc));
+	    break;
+	}
+	fprintf(stdout, ">> Debug: RR: %s %d\n", fqdn, rrtype);
+	rc = getdns_list_set_dict(support_rrs, n_rrs, rr_dict);
+	getdns_dict_destroy(rr_dict);
+	if (rc)
+	    break;
+	n_rrs++;
+    }
+    fprintf(stdout, "Number of RRs in chain: %zu\n", n_rrs);
     return 1;
 }
 
@@ -225,6 +291,8 @@ int main(int argc, char **argv)
     const SSL_CIPHER *cipher = NULL;
     X509_VERIFY_PARAM *vpm = NULL;
     BIO *sbio;
+    char buffer[MYBUFSIZE];
+    int readn;
 
     uint8_t usage, selector, mtype;
 
@@ -380,22 +448,6 @@ int main(int argc, char **argv)
 	SSL_set_bio(ssl, sbio, sbio);
 	(void) SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
 
-#if 0
-	/* Add TLSA record set rdata to TLS connection context */
-	tlsa_rdata *rp;
-	for (rp = tlsa_rdata_list; rp != NULL; rp = rp->next) {
-	    rc = SSL_dane_tlsa_add(ssl, rp->usage, rp->selector, rp->mtype, 
-				   rp->data, rp->data_len);
-	    if (rc < 0) {
-		printf("SSL_dane_tlsa_add() failed.\n");
-		ERR_print_errors_fp(stderr);
-		SSL_free(ssl);
-		close(sock);
-		continue;
-	    }
-	}
-#endif
-
 	/* Do application specific STARTTLS conversation if requested */
 	if (starttls != STARTTLS_NONE && !do_starttls(starttls, sbio, service_name, hostname)) {
 	    fprintf(stderr, "STARTTLS failed.\n");
@@ -421,7 +473,7 @@ int main(int argc, char **argv)
 
 	/* Print Certificate Chain information (if in debug mode) */
 	if (debug)
-	    print_cert_chain(ssl);
+	    print_peer_cert_chain(ssl);
 
 	/* Report results of DANE or PKIX authentication of peer cert */
 	if ((rcl = SSL_get_verify_result(ssl)) == X509_V_OK) {
@@ -453,9 +505,32 @@ int main(int argc, char **argv)
 	    ERR_print_errors_fp(stderr);
 	}
 
-	/* Shutdown and wait for peer shutdown*/
-	while (SSL_shutdown(ssl) == 0)
-	    ;
+#if 0
+	/* This doesn't work yet */
+	/* Do minimal HTTP 1.0 conversation*/
+	BIO *fbio = BIO_new(BIO_f_buffer());
+	BIO_push(fbio, sbio);
+
+	BIO_printf(fbio, "GET / HTTP/1.0\r\n\r\n");
+	while (1) {
+	    fprintf(stdout, "about to read() ..\n");
+	    readn = BIO_gets(fbio, buffer, MYBUFSIZE);
+	    fprintf(stdout, "read %d octets ..\n", readn);
+	    if (readn == 0)
+		break;
+	    buffer[readn] = '\0';
+	    if (debug) {
+		fprintf(stdout, "recv: %s\n", buffer);
+	    }
+	}
+	BIO_pop(fbio);
+	BIO_free(fbio);
+#endif
+
+	sleep(1);
+
+	/* Shutdown */
+	SSL_shutdown(ssl);
 	SSL_free(ssl);
 	close(sock);
 	(void) fputc('\n', stdout);
@@ -464,13 +539,10 @@ int main(int argc, char **argv)
 
 cleanup:
     freeaddrinfo(gai_result);
-    free(dnssec_chain_data);
-    free_tlsa(tlsa_rdata_list);
     if (ctx) {
 	X509_VERIFY_PARAM_free(vpm);
 	SSL_CTX_free(ctx);
     }
 
-    /* Returns 0 if at least one SSL peer authenticates */
     return return_status;
 }
