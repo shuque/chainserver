@@ -292,6 +292,11 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
 	(void) getdns_dict_get_list(reply, "answer", &answer);
 	(void) getdns_list_get_length(answer, &rr_count);
 
+	if (rr_count == 0) {
+	    (void) fprintf(stderr, "FAIL: %s: NODATA response.\n", qname);
+	    return NULL;
+	}
+
 	for ( j = 0; j < rr_count; j++ ) {
 	    getdns_dict *rr = NULL;
 	    getdns_bindata *wire = malloc(sizeof(getdns_bindata));
