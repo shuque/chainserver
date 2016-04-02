@@ -349,8 +349,14 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
 
 	for ( j = 0; j < rr_count; j++ ) {
 	    getdns_dict *rr = NULL;
+	    getdns_bindata *wire = malloc(sizeof(getdns_bindata));
 	    (void) getdns_list_get_dict(answer, j, &rr);
-	    wire = get_wire_rr(rr);
+	    rc = getdns_rr_dict2wire(rr, &wire->data, &wire->size);
+            if (rc != GETDNS_RETURN_GOOD) {
+		(void) fprintf(stderr, "rrdict2wire() failed: %d\n", rc);
+                return 1;
+            }
+            fprintf(stdout, "Answer RR %zu, wire->size=%zu\n", j, wire->size);
 	    wp = insert_wirerr(wp, wire);
 	}
 
@@ -368,8 +374,13 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
 
     for ( i = 0; i < rr_count; i++ ) {	
 	getdns_dict *rr = NULL;
+        getdns_bindata *wire = malloc(sizeof(getdns_bindata));
 	(void) getdns_list_get_dict(val_chain, i, &rr);
-	wire = get_wire_rr(rr);
+	rc = getdns_rr_dict2wire(rr, &wire->data, &wire->size);
+        if (rc != GETDNS_RETURN_GOOD) {
+            (void) fprintf(stderr, "rrdict2wire() failed: %d\n", rc);
+            return 1;
+        }
 	wp = insert_wirerr(wp, wire);
     }
 
