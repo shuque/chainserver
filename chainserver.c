@@ -206,7 +206,7 @@ void free_wirerr_list(wirerr *head)
 
 getdns_bindata *getchain(char *qname, uint16_t qtype)
 {
-    unsigned char *cp;
+    unsigned char *cp, *cp1, *cp2;
     getdns_context *ctx = NULL;
     getdns_return_t rc;
     getdns_dict    *extensions = NULL;
@@ -327,16 +327,16 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
     *(cp + 2) = (wirerr_size >> 8) & 0xff;            /* Extension (data) Size */
     *(cp + 3) = (wirerr_size) & 0xff;
 
-    cp = chaindata->data + 4 + 1;
+    cp = chaindata->data + 4;
+
     for (wp = wirerr_list; wp != NULL; wp = wp->next) {
 	getdns_bindata *g = wp->node;
-	(void) strncat((char *) cp, (char *) g->data, g->size);
+	(void) memcpy(cp, g->data, g->size);
 	cp += g->size;
     }
 
-    fprintf(stdout, "\nDEBUG: chaindata: %s\n\n", 
-	    (cp = bindata2hexstring(chaindata)));
-    free(cp);
+    fprintf(stdout, "\nDEBUG (REMOVE ME) chaindata:\n%s\n\n", 
+	    bindata2hexstring(chaindata));
 
     return chaindata;
 }
