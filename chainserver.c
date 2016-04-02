@@ -342,7 +342,7 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
     chaindata->data = malloc(chaindata->size);
 
     cp = chaindata->data;
-    *(cp + 0) = (DNSSEC_CHAIN_EXT_TYPE >> 8) & 0xff;  /* Extension Type */
+    *(cp + 0) = (DNSSEC_CHAIN_EXT_TYPE >> 8) & 0xff;  /* Extension Type 53 */
     *(cp + 1) = (DNSSEC_CHAIN_EXT_TYPE) & 0xff;
     *(cp + 2) = (wirerr_size >> 8) & 0xff;            /* Extension (data) Size */
     *(cp + 3) = (wirerr_size) & 0xff;
@@ -359,6 +359,52 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
 	    bindata2hexstring(chaindata));
 
     return chaindata;
+}
+
+
+#define MYBUFSIZE 2048
+
+/*
+ * do_http()
+ */
+
+int do_http(BIO *sbio)
+{
+
+    char buffer[MYBUFSIZE];
+    int readn;
+    int seen_get_request = 0;
+
+    /* read request */
+    while (1) {
+	readn = BIO_read(sbio, buffer, MYBUFSIZE);
+	if (readn == 0)
+	    break;
+	buffer[readn] = '\0';
+	if (debug) {
+	    fprintf(stdout, "recv: %s\n", buffer);
+	}
+	if (strncmp("GET ", buffer, 4) == 0) {
+	    seen_get_request = 1;
+	}
+    }
+
+    if (!seen_get_request) {
+	fprintf(stdout, "Did not see HTTP request from client.\n");
+	return 0;
+    }
+
+    /* send response */
+    BIO_puts(sbio, "HTTP/1.0 200 ok\r\nContent-type: text/html\r\n\r\n");
+    BIO_puts(sbio, "<html><title>Chainserver</title>\n<BODY BGCOLOR=\"#ffffff\">\n");
+    BIO_puts(sbio, "<h2>Chainserver</h2>\n");
+    BIO_puts(sbio, "<pre>\n");
+    BIO_puts(sbio, OpenSSL_version(OPENSSL_VERSION));
+    BIO_puts(sbio, "\n");
+    BIO_puts(sbio, "</pre>\n</body>\n</html>\n");
+    (void) BIO_flush(sbio);
+
+    return 1;
 }
 
 
@@ -430,9 +476,6 @@ int main(int argc, char **argv)
 	}
     }
 
-    /* SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL); */
-    SSL_CTX_set_verify_depth(ctx, 10);
-
     /* 
      * Read my server certificate and private key
      */
@@ -497,7 +540,7 @@ int main(int argc, char **argv)
 	close(sock);
 	goto cleanup;
     }
-    fprintf(stdout, "Server listening on port %d\n", port);
+    fprintf(stdout, "Chain Server listening on port %d\n", port);
 
     int clisock;
 
@@ -543,7 +586,7 @@ int main(int argc, char **argv)
 	sbio = BIO_new_socket(clisock, BIO_NOCLOSE);
 	SSL_set_bio(ssl, sbio, sbio);
 
-	/* Perform TLS connection handshake & peer authentication */
+	/* Perform TLS connection handshake */
 	if (SSL_accept(ssl) <= 0) {
 	    fprintf(stderr, "TLS connection failed.\n");
 	    ERR_print_errors_fp(stderr);
@@ -557,6 +600,9 @@ int main(int argc, char **argv)
 		SSL_CIPHER_get_version(cipher), SSL_CIPHER_get_name(cipher));
 
 	/* TODO: read HTTP request and spit out a response */
+#if 0
+	do_http(sbio);
+#endif
 	sleep(2);
 
 	/* Shutdown */
@@ -573,6 +619,5 @@ cleanup:
 	SSL_CTX_free(ctx);
     }
 
-    /* Returns 0 if at least one SSL peer authenticates */
     return return_status;
 }
