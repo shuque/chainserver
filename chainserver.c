@@ -2,7 +2,6 @@
  * chainserver.c
  * Work-in-Progress ...
  *
- * Author: Shumon Huque <shuque@gmail.com>
  */
 
 #include <stdio.h>
