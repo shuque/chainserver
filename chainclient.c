@@ -329,9 +329,7 @@ int main(int argc, char **argv)
      * Initialize OpenSSL TLS library context, certificate authority
      * stores, and hostname verification parameters.
      */
-
-    SSL_load_error_strings();
-    SSL_library_init();
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS, NULL);
 
     ctx = SSL_CTX_new(TLS_client_method());
     (void) SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3);
