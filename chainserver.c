@@ -27,6 +27,14 @@
 
 #include "utils.h"
 
+
+/*
+ * DNSSEC Authentication Chain TLS extension type value
+ */
+
+#define DNSSEC_CHAIN_EXT_TYPE 53
+
+
 /*
  * Server certificate and key files (PEM format) - hardcoded defaults.
  */
@@ -151,44 +159,6 @@ void parse_options(const char *progname, int argc, char **argv)
 
 
 /*
- * dnssec_chain_parse_cb()
- * TODO:
- * This routine will parse a dnssec_chain extension from the server
- * and then authenticate the server's certificate with the validated
- * TLSA record set from the chain.
- *
- */
-
-#define UNUSED_PARAM(x) ((void) (x))
-
-static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
-				 const unsigned char *ext_data, size_t ext_len,
-				 int *al, void *arg)
-{
-    char *cp;
-
-    UNUSED_PARAM(ssl);
-    UNUSED_PARAM(al);
-    UNUSED_PARAM(arg);
-
-    dnssec_chain_data = (unsigned char *) malloc(ext_len);
-    memcpy(dnssec_chain_data, ext_data, ext_len);
-
-    if (debug) {
-	fprintf(stdout, "Received DNSSEC chain extension (%d).\n"
-		"Extension data length = %zu octets.\n", ext_type, ext_len);
-	fprintf(stdout, "Data = %s\n", 
-		(cp = bin2hexstring(dnssec_chain_data, ext_len)));
-	free(cp);
-    }
-
-    /* TODO: process and authenticate chain data here */
-
-    return 1;
-}
-
-
-/*
  * Linked List of Wire format RRs and associated routines.
  */
 
@@ -231,56 +201,16 @@ void free_wirerr_list(wirerr *head)
 
 
 /*
- * get_wire_rr() - given a getdns rr dict, return a getdns_bindata
- * structure containing the wire format of the rr.
- */
-
-getdns_bindata *get_wire_rr(getdns_dict *rr)
-{
-    getdns_bindata *wire = malloc(sizeof(getdns_bindata));
-    unsigned char *data;
-    getdns_bindata *rrname;
-    uint32_t rrtype, ttl;
-    getdns_dict *rdata = NULL;
-    getdns_bindata *rdata_raw;
-    
-    (void) getdns_dict_get_bindata(rr, "name", &rrname);
-    (void) getdns_dict_get_int(rr, "type", &rrtype);
-    (void) getdns_dict_get_int(rr, "ttl", &ttl);
-    (void) getdns_dict_get_dict(rr, "rdata", &rdata);
-    (void) getdns_dict_get_bindata(rdata, "rdata_raw", &rdata_raw);
-
-    wire->size = rrname->size + rdata_raw->size + 10;
-    data = malloc(wire->size);
-    memcpy(data, rrname->data, rrname->size);
-    *(data + rrname->size) = (rrtype >> 8) & 0xff;               /* qtype */
-    *(data + rrname->size + 1) = rrtype & 0xff;
-    *(data + rrname->size + 2) = 0;                              /* qclass */
-    *(data + rrname->size + 3) = 1;
-    *(data + rrname->size + 4) = (ttl >> 24) & 0xff;             /* ttl */
-    *(data + rrname->size + 5) = (ttl >> 16) & 0xff;
-    *(data + rrname->size + 6) = (ttl >> 8) & 0xff;
-    *(data + rrname->size + 7) = ttl & 0xff;
-    *(data + rrname->size + 8) = (rdata_raw->size >> 8) & 0xff;  /* rdlen */
-    *(data + rrname->size + 9) = rdata_raw->size & 0xff;
-    memcpy(data + rrname->size + 10, rdata_raw->data, rdata_raw->size);
-    wire->data = data;
-    return wire;
-}
-
-
-/*
  * getchain(): get DNSSEC chain data for given qname, qtype
  */
 
 getdns_bindata *getchain(char *qname, uint16_t qtype)
 {
-    char *cp;
+    unsigned char *cp;
     getdns_context *ctx = NULL;
     getdns_return_t rc;
     getdns_dict    *extensions = NULL;
     getdns_dict *response;
-    getdns_bindata *wire;
     getdns_bindata *chaindata = malloc(sizeof(getdns_bindata));
     wirerr *wp = wirerr_list;
 
@@ -356,7 +286,6 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
 		(void) fprintf(stderr, "rrdict2wire() failed: %d\n", rc);
                 return 1;
             }
-            fprintf(stdout, "Answer RR %zu, wire->size=%zu\n", j, wire->size);
 	    wp = insert_wirerr(wp, wire);
 	}
 
@@ -387,17 +316,27 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
     getdns_context_destroy(ctx);
 
     /* 
-     * Generate chaindata and return pointer to it.
+     * Generate dnssec_chain extension data and return pointer to it.
      */
-    chaindata->size = wirerr_size;
-    chaindata->data = malloc(wirerr_size + 1);
-    cp = chaindata->data;
+    chaindata->size = 4 + wirerr_size;
+    chaindata->data = malloc(chaindata->size);
 
+    cp = chaindata->data;
+    *(cp + 0) = (DNSSEC_CHAIN_EXT_TYPE >> 8) & 0xff;  /* Extension Type */
+    *(cp + 1) = (DNSSEC_CHAIN_EXT_TYPE) & 0xff;
+    *(cp + 2) = (wirerr_size >> 8) & 0xff;            /* Extension (data) Size */
+    *(cp + 3) = (wirerr_size) & 0xff;
+
+    cp = chaindata->data + 4 + 1;
     for (wp = wirerr_list; wp != NULL; wp = wp->next) {
 	getdns_bindata *g = wp->node;
 	(void) strncat((char *) cp, (char *) g->data, g->size);
 	cp += g->size;
     }
+
+    fprintf(stdout, "\nDEBUG: chaindata: %s\n\n", 
+	    (cp = bindata2hexstring(chaindata)));
+    free(cp);
 
     return chaindata;
 }
@@ -437,9 +376,10 @@ int main(int argc, char **argv)
 
     snprintf(tlsa_name, 512, "_%d._tcp.%s", port, server_name);
     chaindata = getchain(tlsa_name, GETDNS_RRTYPE_TLSA);
-    if (chaindata)
-	fprintf(stdout, "Got DNSSEC chain data for %s\n", tlsa_name);
-    else {
+    if (chaindata) {
+	fprintf(stdout, "Got DNSSEC chain data for %s, size=%zu octets\n", 
+		tlsa_name, chaindata->size - 4);
+    } else {
 	fprintf(stdout, "Failed to get DNSSEC chain data for %s\n", tlsa_name);
 	/* return 1; */
     }
@@ -488,6 +428,16 @@ int main(int argc, char **argv)
 	ERR_print_errors_fp(stderr);
 	goto cleanup;
     }   
+
+    /*
+     * load dnssec_chain Server Hello extensions into context
+     */
+
+    if (chaindata)
+	if (!SSL_CTX_use_serverinfo(ctx, chaindata->data, chaindata->size)) {
+	    fprintf(stderr, "failed loading dnssec_chain_data extension.\n");
+	    goto cleanup;
+	}
 
     /*
      * Setup session resumption capability
