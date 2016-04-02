@@ -206,7 +206,8 @@ void free_wirerr_list(wirerr *head)
 
 getdns_bindata *getchain(char *qname, uint16_t qtype)
 {
-    unsigned char *cp, *cp1, *cp2;
+    unsigned char *cp;
+    uint32_t status;
     getdns_context *ctx = NULL;
     getdns_return_t rc;
     getdns_dict    *extensions = NULL;
@@ -247,12 +248,26 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
 	return NULL;
     }
 
-    uint32_t status;
-    rc = getdns_dict_get_int(response, "status", &status);
-    if (status != GETDNS_RESPSTATUS_GOOD) {
-	(void) fprintf(stderr, "FAILED query: %s: rc=%d, %s\n", 
-		       qname, status, getdns_get_errorstr_by_id(status));
+    (void) getdns_dict_get_int(response, "status", &status);
+
+    switch (status) {
+    case GETDNS_RESPSTATUS_GOOD:
+	break;
+    case GETDNS_RESPSTATUS_NO_NAME:
+	fprintf(stderr, "FAIL: %s: Non existent domain name.\n", qname);
 	return NULL;
+    case GETDNS_RESPSTATUS_ALL_TIMEOUT:
+	fprintf(stderr, "FAIL: %s: Query timed out.\n", qname);
+	return NULL;
+    case GETDNS_RESPSTATUS_NO_SECURE_ANSWERS:
+	fprintf(stderr, "%s: Insecure address records.\n", qname);
+	return NULL;
+    case GETDNS_RESPSTATUS_ALL_BOGUS_ANSWERS:
+	fprintf(stderr, "FAIL: %s: All bogus answers.\n", qname);
+	return NULL;
+    default:
+        fprintf(stderr, "FAIL: %s: error status code: %d.\n", qname, status);
+        return NULL;
     }
 
     getdns_list *replies_tree;
@@ -284,7 +299,7 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
 	    rc = getdns_rr_dict2wire(rr, &wire->data, &wire->size);
             if (rc != GETDNS_RETURN_GOOD) {
 		(void) fprintf(stderr, "rrdict2wire() failed: %d\n", rc);
-                return 1;
+                return NULL;
             }
 	    wp = insert_wirerr(wp, wire);
 	}
@@ -308,7 +323,7 @@ getdns_bindata *getchain(char *qname, uint16_t qtype)
 	rc = getdns_rr_dict2wire(rr, &wire->data, &wire->size);
         if (rc != GETDNS_RETURN_GOOD) {
             (void) fprintf(stderr, "rrdict2wire() failed: %d\n", rc);
-            return 1;
+            return NULL;
         }
 	wp = insert_wirerr(wp, wire);
     }
