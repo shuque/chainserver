@@ -220,7 +220,7 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     getdns_list *append_to = to_validate_rrs;
     getdns_dict *rr_dict;
     getdns_return_t rc;
-    size_t buf_len, n_rrs;
+    size_t buf_len, n_rrs, i;
     uint32_t rrtype;
     getdns_bindata *rrname = NULL;
     char *fqdn;
@@ -243,7 +243,7 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     }
 
     /* TODO: process and authenticate chain data here */
-    n_rrs = 0;
+    i = n_rrs = 0;
     buf_len = ext_len;
     while (buf_len > 0) {
 	rc = getdns_wire2rr_dict_scan(&dnssec_chain_data, &buf_len, &rr_dict);
@@ -266,12 +266,13 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
 				"/rdata/type_covered", &rrtype);
 
 	    if (rrtype == GETDNS_RRTYPE_DS || rrtype == GETDNS_RRTYPE_DNSKEY) {
+		i = 0;
 		append_to = support_rrs;
 		fprintf(stderr, "-----------------------------------------\n");
 	    }
 	}
 	fprintf(stdout, ">> Debug: RR: %s %d\n", fqdn, rrtype);
-	rc = getdns_list_set_dict(support_rrs, n_rrs, rr_dict);
+	rc = getdns_list_set_dict(append_to, i++, rr_dict);
 	getdns_dict_destroy(rr_dict);
 	if (rc)
 	    break;
