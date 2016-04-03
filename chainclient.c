@@ -221,11 +221,13 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     getdns_dict *rr_dict;
     getdns_return_t rc;
     size_t buf_len, n_rrs, i;
-    uint32_t rrtype;
-    getdns_bindata *rrname = NULL;
+    uint32_t rrtype, usage, selector, mtype;
+    getdns_bindata *rrname = NULL, *cert_assoc_data;
     char *fqdn;
     getdns_list *trust_anchors;
     getdns_return_t dnssec_status;
+    int ssl_rc;
+    const char *hostname = (const char *)arg;
 
     UNUSED_PARAM(ssl);
     UNUSED_PARAM(al);
@@ -288,12 +290,49 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
 	dnssec_status = getdns_validate_dnssec(
 		to_validate_rrs, support_rrs, trust_anchors);
 	fprintf(stdout, "dnssec status: %s\n",
-		  dnssec_status == GETDNS_DNSSEC_SECURE ? "SECURE"
-		: dnssec_status == GETDNS_DNSSEC_BOGUS ? "BOGUS"
-		: dnssec_status == GETDNS_DNSSEC_INDETERMINATE ? "INDETERMINATE"
-		: dnssec_status == GETDNS_DNSSEC_INSECURE ? "INSECURE"
-		: dnssec_status == GETDNS_DNSSEC_NOT_PERFORMED ? "NOT PERFORMED"
-		: getdns_get_errorstr_by_id(dnssec_status));
+			getdns_get_errorstr_by_id(dnssec_status));
+    }
+    getdns_list_destroy(support_rrs);
+    getdns_list_destroy(trust_anchors);
+    if (dnssec_status != GETDNS_DNSSEC_SECURE) {
+    	getdns_list_destroy(to_validate_rrs);
+	return 0;
+    }
+    if ((rc = getdns_list_get_length(to_validate_rrs, &n_rrs))) {
+    	getdns_list_destroy(to_validate_rrs);
+    	return 0;
+    }
+    fprintf(stderr, "hostname: %s.\n", hostname);
+    if ((ssl_rc = SSL_dane_enable(ssl, hostname)) <= 0) {
+	fprintf(stderr, "SSL_dane_enable() failed.\n");
+	ERR_print_errors_fp(stderr);
+    }
+    for (i = 0; i < n_rrs; i++) {
+	if ((rc = getdns_list_get_dict(to_validate_rrs, i, &rr_dict)) ||
+	    (rc = getdns_dict_get_int(rr_dict, "type", &rrtype))) {
+	    getdns_list_destroy(to_validate_rrs);
+	    return 0;
+	}
+        if (rrtype != GETDNS_RRTYPE_TLSA)
+	    continue;
+	if ((rc = getdns_dict_get_int(rr_dict,
+			"/rdata/certificate_usage", &usage)) ||
+	    (rc = getdns_dict_get_int(rr_dict,
+			"/rdata/matching_type", &mtype)) ||
+	    (rc = getdns_dict_get_int(rr_dict,
+			"/rdata/selector", &selector)) ||
+	    (rc = getdns_dict_get_bindata(rr_dict,
+			"/rdata/certificate_association_data",
+			&cert_assoc_data))) {
+	    getdns_list_destroy(to_validate_rrs);
+	    return 0;
+	}
+	if ((ssl_rc = SSL_dane_tlsa_add(ssl, usage, selector, mtype,
+			cert_assoc_data->data, cert_assoc_data->size)) <= 0) {
+
+	    fprintf(stderr, "SSL_dane_tlsa_add() failed.\n");
+	    ERR_print_errors_fp(stderr);
+	}
     }
     return 1;
 }
@@ -401,7 +440,7 @@ int main(int argc, char **argv)
 
     if (dnssec_chain && 
 	!SSL_CTX_add_client_custom_ext(ctx, 53, NULL, NULL, NULL,
-				       dnssec_chain_parse_cb, NULL)) {
+				       dnssec_chain_parse_cb, hostname)) {
 	fprintf(stderr,
 		"Warning: Couldn't set DNSSEC chain extension, skipping\n");
     }
