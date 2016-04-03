@@ -8,11 +8,11 @@ INSTALL		= ./install-sh
 INSTALL_PROG	= $(INSTALL)
 INSTALL_DATA	= $(INSTALL) -m 644
 
-PROG    = chainclient chainserver
+PROG    = chainclient chainserver getchain
 
-INCLUDE = -I. -I/usr/local/openssl/include -I/usr/local/include
+INCLUDE = -I. -I/usr/local/openssl/include -I/usr/local/getdns/include
 CFLAGS  = -g -Wall -Wextra $(INCLUDE)
-LDFLAGS = -L/usr/local/openssl/lib -L/usr/local/lib -Wl,-rpath -Wl,/usr/local/openssl/lib -Wl,-rpath -Wl,/usr/local/lib
+LDFLAGS = -L/usr/local/openssl/lib -L/usr/local/getdns/lib -Wl,-rpath -Wl,/usr/local/openssl/lib -Wl,-rpath -Wl,/usr/local/getdns/lib
 LIBS_LDNS    = -lssl -lcrypto -lldns
 LIBS_GETDNS  = -lssl -lcrypto -lldns -lgetdns_ext_event -lgetdns -levent_core -lunbound -lidn
 CC      = cc
@@ -23,10 +23,10 @@ CC      = cc
 
 all:		$(PROG)
 
-chainclient:	chainclient.o query-ldns.o utils.o starttls.o
-		$(CC) $(LDFLAGS) -o $@ $^ $(LIBS_LDNS)
+chainclient:	chainclient.o utils.o starttls.o
+		$(CC) $(LDFLAGS) -o $@ $^ $(LIBS_GETDNS)
 
-chainserver:	chainserver.o query-ldns.o utils.o
+chainserver:	chainserver.o utils.o
 		$(CC) $(LDFLAGS) -o $@ $^ $(LIBS_GETDNS)
 
 getchain:	getchain.o utils.o
