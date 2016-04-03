@@ -52,6 +52,12 @@ enum AUTH_MODE auth_mode = MODE_BOTH;
 char *CAfile = NULL;
 char *service_name = NULL;
 
+/*
+ * DNSSEC Authentication Chain TLS extension type value etc
+ */
+
+#define DNSSEC_CHAIN_EXT_TYPE 53
+
 int dnssec_chain = 1;
 unsigned char *dnssec_chain_data = NULL;
 
@@ -201,10 +207,9 @@ void print_validated_chain(SSL *ssl)
 
 /*
  * dnssec_chain_parse_cb()
- * TODO:
- * This routine will parse a dnssec_chain extension from the server
- * and then authenticate the server's certificate with the validated
- * TLSA record set from the chain.
+ * This routine will parse a dnssec_chain extension from the server,
+ * authenticate it with DNSSEC, and then authenticate the server's 
+ * certificate with the validated TLSA record set from the chain.
  *
  */
 
@@ -244,7 +249,7 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
 	free(cp);
     }
 
-    /* TODO: process and authenticate chain data here */
+    /* Parse the authentication chain */
     i = n_rrs = 0;
     buf_len = ext_len;
     while (buf_len > 0) {
@@ -302,7 +307,7 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     	getdns_list_destroy(to_validate_rrs);
     	return 0;
     }
-    fprintf(stderr, "hostname: %s.\n", hostname);
+
     if ((ssl_rc = SSL_dane_enable(ssl, hostname)) <= 0) {
 	fprintf(stderr, "SSL_dane_enable() failed.\n");
 	ERR_print_errors_fp(stderr);
@@ -430,13 +435,15 @@ int main(int argc, char **argv)
     SSL_CTX_set_verify_depth(ctx, 10);
 
     /*
-     * Set dnssec_chain extension, if requested (experimental).
-     * Currently this only sends the extension, but doesn't do
-     * anything with the server response.
+     * Set TLS extension for DNSSEC authentication chain. This sends
+     * an empty extension of type 53 in the ClientHello message, and
+     * registers a callback function to process the corresponding
+     * extension from the server.
      */
 
     if (dnssec_chain && 
-	!SSL_CTX_add_client_custom_ext(ctx, 53, NULL, NULL, NULL,
+	!SSL_CTX_add_client_custom_ext(ctx, DNSSEC_CHAIN_EXT_TYPE, 
+				       NULL, NULL, NULL,
 				       dnssec_chain_parse_cb, hostname)) {
 	fprintf(stderr,
 		"Warning: Couldn't set DNSSEC chain extension, skipping\n");
