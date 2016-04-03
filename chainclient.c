@@ -354,15 +354,12 @@ int main(int argc, char **argv)
     int return_status = 1;                    /* program return status */
     int rc, sock, optcount;
     long rcl;
-    tlsa_rdata *tlsa_rdata_list = NULL;
 
     SSL_CTX *ctx = NULL;
     SSL *ssl = NULL;
     const SSL_CIPHER *cipher = NULL;
     X509_VERIFY_PARAM *vpm = NULL;
     BIO *sbio;
-    char buffer[MYBUFSIZE];
-    int readn;
 
     uint8_t usage, selector, mtype;
 
@@ -566,6 +563,9 @@ int main(int argc, char **argv)
 		/* Name checks were in scope and matched the peername */
 		fprintf(stdout, "Verified peername: %s\n", peername);
 	    }
+	    /* Print verified certificate chain (if in debug mode) */
+	    if (debug)
+		print_validated_chain(ssl);
 	} else {
 	    /* Authentication failed */
 	    fprintf(stderr, "Error: peer authentication failed. rc=%ld (%s)\n",
