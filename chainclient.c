@@ -215,13 +215,17 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
 				 int *al, void *arg)
 {
     char *cp;
+    getdns_list *to_validate_rrs = getdns_list_create();
     getdns_list *support_rrs = getdns_list_create();
+    getdns_list *append_to = to_validate_rrs;
     getdns_dict *rr_dict;
     getdns_return_t rc;
     size_t buf_len, n_rrs;
     uint32_t rrtype;
     getdns_bindata *rrname = NULL;
     char *fqdn;
+    getdns_list *trust_anchors;
+    getdns_return_t dnssec_status;
 
     UNUSED_PARAM(ssl);
     UNUSED_PARAM(al);
@@ -256,6 +260,16 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
 		    getdns_get_errorstr_by_id(rc));
 	    break;
 	}
+        if (append_to == to_validate_rrs) {
+	    if (rrtype == GETDNS_RRTYPE_RRSIG)
+		(void) getdns_dict_get_int(rr_dict,
+				"/rdata/type_covered", &rrtype);
+
+	    if (rrtype == GETDNS_RRTYPE_DS || rrtype == GETDNS_RRTYPE_DNSKEY) {
+		append_to = support_rrs;
+		fprintf(stderr, "-----------------------------------------\n");
+	    }
+	}
 	fprintf(stdout, ">> Debug: RR: %s %d\n", fqdn, rrtype);
 	rc = getdns_list_set_dict(support_rrs, n_rrs, rr_dict);
 	getdns_dict_destroy(rr_dict);
@@ -264,6 +278,22 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
 	n_rrs++;
     }
     fprintf(stdout, "Number of RRs in chain: %zu\n", n_rrs);
+
+    if (!(trust_anchors = getdns_root_trust_anchor(NULL)))
+	fprintf(stderr, "Could not read trust anchor\n");
+    else {
+    	fprintf(stderr, "%s\n", getdns_pretty_print_list(trust_anchors));
+
+	dnssec_status = getdns_validate_dnssec(
+		to_validate_rrs, support_rrs, trust_anchors);
+	fprintf(stdout, "dnssec status: %s\n",
+		  dnssec_status == GETDNS_DNSSEC_SECURE ? "SECURE"
+		: dnssec_status == GETDNS_DNSSEC_BOGUS ? "BOGUS"
+		: dnssec_status == GETDNS_DNSSEC_INDETERMINATE ? "INDETERMINATE"
+		: dnssec_status == GETDNS_DNSSEC_INSECURE ? "INSECURE"
+		: dnssec_status == GETDNS_DNSSEC_NOT_PERFORMED ? "NOT PERFORMED"
+		: getdns_get_errorstr_by_id(dnssec_status));
+    }
     return 1;
 }
 
