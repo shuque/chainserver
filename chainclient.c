@@ -244,9 +244,6 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     if (debug) {
 	fprintf(stdout, "Received DNSSEC chain extension (%d).\n"
 		"Extension data length = %zu octets.\n", ext_type, ext_len);
-	fprintf(stdout, "Data = %s\n", 
-		(cp = bin2hexstring(dnssec_chain_data, ext_len)));
-	free(cp);
     }
 
     /* Parse the authentication chain */
