@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/wait.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -195,6 +196,22 @@ void free_wirerr_list(wirerr *head)
         free(current->node->data);
 	free(current->node);
         free(current);
+    }
+    return;
+}
+
+
+/*
+ * child signal handler
+ */
+
+void sig_chld(int signo)
+{
+    pid_t pid;
+    int stat;
+
+    while ( (pid = waitpid(-1, &stat, WNOHANG)) > 0) {
+	/* printf("child %d terminated\n", pid); */
     }
     return;
 }
@@ -482,13 +499,13 @@ int main(int argc, char **argv)
      * Read my server certificate and private key
      */
 
-    if (!SSL_CTX_use_certificate_file(ctx, SERVER_CERT, SSL_FILETYPE_PEM)) {
+    if (!SSL_CTX_use_certificate_file(ctx, certfile, SSL_FILETYPE_PEM)) {
 	fprintf(stderr, "Failed to load server certificate.\n");
 	ERR_print_errors_fp(stderr);
 	goto cleanup;
     }
 
-    if (!SSL_CTX_use_PrivateKey_file(ctx, SERVER_KEY, SSL_FILETYPE_PEM)) {
+    if (!SSL_CTX_use_PrivateKey_file(ctx, keyfile, SSL_FILETYPE_PEM)) {
 	fprintf(stderr, "Failed to load server private key.\n");
 	ERR_print_errors_fp(stderr);
 	goto cleanup;
@@ -543,6 +560,13 @@ int main(int argc, char **argv)
 	goto cleanup;
     }
     fprintf(stdout, "Chain Server listening on port %d\n", port);
+
+    /* TODO: redo this properly with sigaction() etc */
+#if 0
+    if (signal(SIGCHLD, sig_chld) == SIG_ERR) {
+	perror("sigchild handler");
+    }
+#endif
 
     int clisock;
 
