@@ -67,6 +67,8 @@ int clientauth = 0;
 int dnssec_chain = 1;
 unsigned char *dnssec_chain_data = NULL;
 
+#define UNUSED_PARAM(x) ((void) (x))
+
 
 /*
  * usage(): Print usage string and exit.
@@ -210,8 +212,8 @@ void sig_chld(int signo)
     pid_t pid;
     int stat;
 
+    UNUSED_PARAM(signo);
     while ( (pid = waitpid(-1, &stat, WNOHANG)) > 0) {
-	/* printf("child %d terminated\n", pid); */
     }
     return;
 }
@@ -540,6 +542,16 @@ int main(int argc, char **argv)
     serv_addr.sin_port = htons((uint16_t) port);
     serv_addr.sin_addr.s_addr = INADDR_ANY;
 
+    /* Setup SIGCHLD handler to reap child processes */
+    struct sigaction sa;
+    sa.sa_handler = &sig_chld;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+	perror("sigaction");
+	goto cleanup;
+    }
+
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == -1) {
 	perror("socket");
@@ -560,13 +572,6 @@ int main(int argc, char **argv)
 	goto cleanup;
     }
     fprintf(stdout, "Chain Server listening on port %d\n", port);
-
-    /* TODO: redo this properly with sigaction() etc */
-#if 0
-    if (signal(SIGCHLD, sig_chld) == SIG_ERR) {
-	perror("sigchild handler");
-    }
-#endif
 
     int clisock;
 
@@ -635,7 +640,9 @@ int main(int argc, char **argv)
 	SSL_shutdown(ssl);
 	SSL_free(ssl);
 	close(clisock);
+	return return_status;
     }
+
     close(sock);
 
 cleanup:
