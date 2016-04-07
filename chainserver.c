@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/wait.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -67,6 +68,8 @@ int clientauth = 0;
 int dnssec_chain = 1;
 unsigned char *dnssec_chain_data = NULL;
 char *proxy = NULL;
+
+#define UNUSED_PARAM(x) ((void) (x))
 
 
 /*
@@ -205,6 +208,22 @@ void free_wirerr_list(wirerr *head)
         free(current->node->data);
 	free(current->node);
         free(current);
+    }
+    return;
+}
+
+
+/*
+ * child signal handler
+ */
+
+void sig_chld(int signo)
+{
+    pid_t pid;
+    int stat;
+
+    UNUSED_PARAM(signo);
+    while ( (pid = waitpid(-1, &stat, WNOHANG)) > 0) {
     }
     return;
 }
@@ -577,13 +596,13 @@ int main(int argc, char **argv)
      * Read my server certificate and private key
      */
 
-    if (!SSL_CTX_use_certificate_file(ctx, SERVER_CERT, SSL_FILETYPE_PEM)) {
+    if (!SSL_CTX_use_certificate_file(ctx, certfile, SSL_FILETYPE_PEM)) {
 	fprintf(stderr, "Failed to load server certificate.\n");
 	ERR_print_errors_fp(stderr);
 	goto cleanup;
     }
 
-    if (!SSL_CTX_use_PrivateKey_file(ctx, SERVER_KEY, SSL_FILETYPE_PEM)) {
+    if (!SSL_CTX_use_PrivateKey_file(ctx, keyfile, SSL_FILETYPE_PEM)) {
 	fprintf(stderr, "Failed to load server private key.\n");
 	ERR_print_errors_fp(stderr);
 	goto cleanup;
@@ -611,7 +630,6 @@ int main(int argc, char **argv)
     sbio = BIO_new_ssl(ctx,0);
 
     BIO_get_ssl(sbio, &ssl);
-
     if(!ssl) {
         fprintf(stderr, "Can't locate SSL pointer\n");
         /* whatever ... */
