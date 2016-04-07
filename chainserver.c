@@ -436,9 +436,9 @@ int do_http(BIO *sbio)
 }
 
 struct chunk {
-	size_t        size;
-	uint8_t      *data;
 	struct chunk *next;
+	size_t        size;
+	uint8_t       data[];
 };
 
 struct session {
@@ -447,6 +447,102 @@ struct session {
 	struct chunk *to_bio;
 	struct chunk *to_remote;
 };
+static void free_chunks(struct chunk *c)
+{
+	if (c) {
+		free_chunks(c->next);
+		free(c);
+	}
+}
+
+static void do_bio_read(struct session *s)
+{
+	uint8_t buf[65536];
+	ssize_t len = BIO_read(s->sbio, buf, sizeof(buf));
+	struct chunk **chunk_p;
+
+	if (len == 0) {
+		/* close */
+		free_chunks(s->to_remote);
+		free_chunks(s->to_bio);
+		s->to_remote = s->to_bio = NULL;
+		BIO_free_all(s->sbio);
+		s->sbio = NULL;
+		close(s->remote);
+		s->remote = -1;
+		return;
+	}
+	if (len < 0) /* error */
+		return;
+
+	/* Append a new chunk */
+	for (chunk_p = &s->to_remote; *chunk_p; chunk_p = &(*chunk_p)->next)
+		; /* pass */
+
+	*chunk_p = (struct chunk *)malloc(sizeof(struct chunk) + len);
+	(*chunk_p)->next = NULL;
+	(*chunk_p)->size = len;
+	memcpy((*chunk_p)->data, buf, len);
+}
+
+static void do_bio_write(struct session *s)
+{
+	struct chunk *c = s->to_bio;
+	if (!c)
+		return;
+
+	s->to_bio = c->next;
+	BIO_write(s->sbio, c->data, c->size);
+	free(c);
+}
+
+static void do_remote_read(struct session *s)
+{
+	uint8_t buf[65536];
+	ssize_t len = read(s->remote, buf, sizeof(buf));
+	struct chunk **chunk_p;
+	SSL *ssl;
+	int sock;
+
+	if (len == 0) {
+		/* close */
+		free_chunks(s->to_remote);
+		free_chunks(s->to_bio);
+		s->to_remote = s->to_bio = NULL;
+		BIO_get_ssl(s->sbio, &ssl);
+		SSL_shutdown(ssl);
+		BIO_get_fd(s->sbio, &sock);
+		close(sock);
+		BIO_free_all(s->sbio);
+		s->sbio = NULL;
+		s->remote = -1;
+		return;
+	}
+	if (len < 0) /* error */ {
+		perror("read()");
+		return;
+	}
+
+	/* Append a new chunk */
+	for (chunk_p = &s->to_bio; *chunk_p; chunk_p = &(*chunk_p)->next)
+		; /* pass */
+
+	*chunk_p = (struct chunk *)malloc(sizeof(struct chunk) + len);
+	(*chunk_p)->next = NULL;
+	(*chunk_p)->size = len;
+	memcpy((*chunk_p)->data, buf, len);
+}
+
+static void do_remote_write(struct session *s)
+{
+	struct chunk *c = s->to_remote;
+	if (!c)
+		return;
+
+	s->to_remote = c->next;
+	write(s->remote, c->data, c->size);
+	free(c);
+}
 
 static void do_proxy(BIO *acpt)
 {
@@ -480,18 +576,18 @@ static void do_proxy(BIO *acpt)
 
 		max_fd = accept_sock;
 		for (i = 0; i < FD_SETSIZE; i++) {
-			if (sessions[i].sbio) {
-				FD_SET(i, &rfds);
-				if (sessions[i].to_bio)
-					FD_SET(i, &wfds);
-				FD_SET(sessions[i].remote, &rfds);
-				if (sessions[i].to_remote)
-					FD_SET(sessions[i].remote, &wfds);
-				if (i > max_fd)
-					max_fd = i;
-				if (sessions[i].remote > max_fd)
-					max_fd = sessions[i].remote;
-			}
+			if (!sessions[i].sbio)
+				continue;
+			FD_SET(i, &rfds);
+			if (sessions[i].to_bio)
+				FD_SET(i, &wfds);
+			FD_SET(sessions[i].remote, &rfds);
+			if (sessions[i].to_remote)
+				FD_SET(sessions[i].remote, &wfds);
+			if (i > max_fd)
+				max_fd = i;
+			if (sessions[i].remote > max_fd)
+				max_fd = sessions[i].remote;
 		}
 		max_fd += 1;
 		r = select(max_fd, &rfds, &wfds, NULL, NULL);
@@ -521,6 +617,23 @@ static void do_proxy(BIO *acpt)
 				perror("connect()");
 			}
 			break;
+		}
+		for (i = 0; i < FD_SETSIZE; i++) {
+			if (!sessions[i].sbio)
+				continue;
+
+			if (FD_ISSET(i, &wfds)) {
+				do_bio_write(&sessions[i]);
+			}
+			if (FD_ISSET(sessions[i].remote, &wfds)) {
+				do_remote_write(&sessions[i]);
+			}
+			if (FD_ISSET(i, &rfds)) {
+				do_bio_read(&sessions[i]);
+			}
+			if (FD_ISSET(sessions[i].remote, &rfds)) {
+				do_remote_read(&sessions[i]);
+			}
 		}
 	}
 }
