@@ -19,7 +19,6 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
-#include <ldns/ldns.h>
 
 #include <getdns/getdns.h>
 #include <getdns/getdns_extra.h>
@@ -30,7 +29,6 @@
 #include <openssl/x509v3.h>
 
 #include "utils.h"
-#include "query-ldns.h"
 #include "starttls.h"
 
 
@@ -59,8 +57,6 @@ char *service_name = NULL;
 #define DNSSEC_CHAIN_EXT_TYPE 53
 
 int dnssec_chain = 1;
-unsigned char *dnssec_chain_data = NULL;
-
 
 /*
  * usage(): Print usage string and exit.
@@ -238,14 +234,11 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     UNUSED_PARAM(al);
     UNUSED_PARAM(arg);
 
-    dnssec_chain_data = (unsigned char *) malloc(ext_len);
-    memcpy(dnssec_chain_data, ext_data, ext_len);
-
     if (debug) {
 	fprintf(stdout, "Received DNSSEC chain extension (%d).\n"
 		"Extension data length = %zu octets.\n", ext_type, ext_len);
 	fprintf(stdout, "Data = %s\n", 
-		(cp = bin2hexstring(dnssec_chain_data, ext_len)));
+		(cp = bin2hexstring(ext_data, ext_len)));
 	free(cp);
     }
 
@@ -253,7 +246,7 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     i = n_rrs = 0;
     buf_len = ext_len;
     while (buf_len > 0) {
-	rc = getdns_wire2rr_dict_scan(&dnssec_chain_data, &buf_len, &rr_dict);
+	rc = getdns_wire2rr_dict_scan(&ext_data, &buf_len, &rr_dict);
 	if (rc)
 	    break;
 	if ((rc = getdns_dict_get_bindata(rr_dict, "/name", &rrname))) {
