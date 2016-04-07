@@ -55,6 +55,7 @@ enum AUTH_MODE {
 
 int debug = 0;
 uint16_t port;
+char *port_str;
 enum AUTH_MODE auth_mode = MODE_BOTH;
 char *service_name = NULL;
 
@@ -147,6 +148,7 @@ void parse_options(const char *progname, int argc, char **argv)
 	print_usage(progname);
     }
 
+    port_str = optword;
     port = atoi(optword);
 
     if (!server_name) {
@@ -378,19 +380,16 @@ int do_http(BIO *sbio)
     int seen_get_request = 0;
 
     /* read request */
-    while (1) {
-	readn = BIO_read(sbio, buffer, MYBUFSIZE);
-	if (readn == 0)
-	    break;
-	buffer[readn] = '\0';
-	if (debug) {
-	    fprintf(stdout, "recv: %s\n", buffer);
-	}
-	if (strncmp("GET ", buffer, 4) == 0) {
-	    seen_get_request = 1;
-	}
-    }
+    if ((readn = BIO_read(sbio, buffer, MYBUFSIZE)) <= 0)
+	return 0;
 
+    buffer[readn] = '\0';
+    if (debug) {
+	fprintf(stdout, "recv: (%d) %s\n", readn, buffer);
+    }
+    if (strncmp("GET ", buffer, 4) == 0) {
+	seen_get_request = 1;
+    }
     if (!seen_get_request) {
 	fprintf(stdout, "Did not see HTTP request from client.\n");
 	return 0;
@@ -418,7 +417,6 @@ int main(int argc, char **argv)
 {
 
     const char *progname;
-    char ipstring[INET6_ADDRSTRLEN];
     char tlsa_name[512];
     getdns_bindata *chaindata = NULL;
     int return_status = 1;                    /* program return status */
@@ -427,7 +425,7 @@ int main(int argc, char **argv)
     SSL *ssl = NULL;
     const SSL_CIPHER *cipher = NULL;
     X509_VERIFY_PARAM *vpm = NULL;
-    BIO *sbio;
+    BIO *sbio, *acpt;
 
     /* uint8_t usage, selector, mtype; */
 
@@ -511,108 +509,71 @@ int main(int argc, char **argv)
     const unsigned char *sid_ctx = (const unsigned char *) "chainserver";
     (void) SSL_CTX_set_session_id_context(ctx, sid_ctx, sizeof(sid_ctx));
 
-    /*
-     * Setup listening socket
+    
+    /* New SSL BIO setup as server */
+    sbio = BIO_new_ssl(ctx,0);
+
+    BIO_get_ssl(sbio, &ssl);
+
+    if(!ssl) {
+        fprintf(stderr, "Can't locate SSL pointer\n");
+        /* whatever ... */
+    }
+
+    /* Don't want any retries */
+    SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
+
+    acpt = BIO_new_accept(port_str);
+
+    /* By doing this when a new connection is established
+     * we automatically have sbio inserted into it. The
+     * BIO chain is now 'swallowed' by the accept BIO and
+     * will be freed when the accept BIO is freed.
      */
 
-    struct sockaddr_in serv_addr, cli_addr;
-    socklen_t cli_addr_len = sizeof(struct sockaddr_in);
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    memset(&cli_addr, 0, sizeof(cli_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons((uint16_t) port);
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
+    BIO_set_accept_bios(acpt,sbio);
 
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == -1) {
-	perror("socket");
-	goto cleanup;
+    /* Setup accept BIO */
+    if(BIO_do_accept(acpt) <= 0) {
+	   fprintf(stderr, "Error setting up accept BIO\n");
+	   ERR_print_errors_fp(stderr);
+	   return 0;
     }
 
-    int j = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *) &j, sizeof j);
-    if (bind(sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) == -1) {
-	perror("bind");
-	fprintf(stderr, "Unable to bind to server address.\n");
-	goto cleanup;
+    /* Now wait for incoming connection */
+    if(BIO_do_accept(acpt) <= 0) {
+	   fprintf(stderr, "Error in connection\n");
+	   ERR_print_errors_fp(stderr);
+	   return 0;
     }
 
-    if (listen(sock, 5) == -1) {
-	perror("listen");
-	close(sock);
-	goto cleanup;
-    }
-    fprintf(stdout, "Chain Server listening on port %d\n", port);
-
-    int clisock;
-
-    while (1) {
-
-	pid_t pid;
-	if ((clisock = accept(sock, (struct sockaddr *) &cli_addr, 
-			      &cli_addr_len)) < 0) {
-	    perror("accept");
-	    fprintf(stderr, "Error accepting client socket.\n");
-	    goto cleanup;
+    for (;;) {
+	/* Now wait for incoming connection */
+	if(BIO_do_accept(acpt) <= 0) {
+	       fprintf(stderr, "Error in connection\n");
+	       ERR_print_errors_fp(stderr);
+	       return 0;
 	}
 
-	if ((pid = fork()) == -1) {
-	    perror("fork");
-	    fprintf(stderr, "Error: fork() failed.\n");
-	    /* should we abort here instead? */
-	    close(clisock);
-	    continue;
-	} else if (pid != 0) {
-	    /* parent process */
-	    close(clisock);
-	    continue;
+	sbio = BIO_pop(acpt);
+
+	if(BIO_do_handshake(sbio) <= 0) {
+	       fprintf(stderr, "Error in SSL handshake\n");
+	       ERR_print_errors_fp(stderr);
+	       return 0;
 	}
-
-	/* child process */
-	inet_ntop(AF_INET, &cli_addr.sin_addr, ipstring, sizeof ipstring);
-	fprintf(stdout, "Connection from %s port=%d\n", 
-		ipstring, cli_addr.sin_port);
-
-	ssl = SSL_new(ctx);
-	if (! ssl) {
-	    fprintf(stderr, "SSL_new() failed.\n");
-	    ERR_print_errors_fp(stderr);
-	    close(sock);
-	    continue;
-	}
-
-	/* No partial label wildcards */
-	SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-
-	/* Set connect mode (client) and tie socket to TLS context */
-	sbio = BIO_new_socket(clisock, BIO_NOCLOSE);
-	SSL_set_bio(ssl, sbio, sbio);
-
-	/* Perform TLS connection handshake */
-	if (SSL_accept(ssl) <= 0) {
-	    fprintf(stderr, "TLS connection failed.\n");
-	    ERR_print_errors_fp(stderr);
-	    SSL_free(ssl);
-	    close(sock);
-	    continue;
-	}
+	BIO_get_ssl(sbio, ssl);
 
 	cipher = SSL_get_current_cipher(ssl);
 	fprintf(stdout, "%s Cipher: %s %s\n\n", SSL_get_version(ssl),
 		SSL_CIPHER_get_version(cipher), SSL_CIPHER_get_name(cipher));
 
-	/* TODO: read HTTP request and spit out a response */
-#if 0
 	do_http(sbio);
-#endif
-	sleep(2);
-
-	/* Shutdown */
 	SSL_shutdown(ssl);
-	SSL_free(ssl);
-	close(clisock);
+	BIO_get_fd(sbio, &sock);
+	close(sock);
+    	BIO_free_all(sbio);
     }
-    close(sock);
 
 cleanup:
     free(dnssec_chain_data);
@@ -620,6 +581,5 @@ cleanup:
 	X509_VERIFY_PARAM_free(vpm);
 	SSL_CTX_free(ctx);
     }
-
     return return_status;
 }
