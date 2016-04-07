@@ -66,6 +66,7 @@ char *CAfile = NULL;
 int clientauth = 0;
 int dnssec_chain = 1;
 unsigned char *dnssec_chain_data = NULL;
+char *proxy = NULL;
 
 
 /*
@@ -82,6 +83,7 @@ void print_usage(const char *progname)
 	    "       -key <file>:      server private key file\n"
 	    "       -clientauth:      require client authentication\n"
 	    "       -CAfile <file>:   CA file for client authentication\n"
+	    "       -proxy <ip>:<port>: IPv4 address and port to forward to\n"
 	    "\n",
 	    progname);
     exit(1);
@@ -131,6 +133,12 @@ void parse_options(const char *progname, int argc, char **argv)
 	    CAfile = argv[i];
 	} else if (!strcmp(optword, "-clientauth")) {
 	    clientauth = 1;
+	} else if (!strcmp(optword, "-proxy")) {
+	    if (++i >= argc || !*argv[i]) {
+		fprintf(stderr, "-proxy: proxy address and port expected.\n");
+		print_usage(progname);
+	    }
+	    proxy = argv[i];
 	} else if (optword[0] == '-') {
 	    fprintf(stderr, "Unrecognized option: %s\n", optword);
 	    print_usage(progname);
@@ -408,6 +416,95 @@ int do_http(BIO *sbio)
     return 1;
 }
 
+struct chunk {
+	size_t        size;
+	uint8_t      *data;
+	struct chunk *next;
+};
+
+struct session {
+	BIO *sbio;
+	int remote;
+	struct chunk *to_bio;
+	struct chunk *to_remote;
+};
+
+static void do_proxy(BIO *acpt)
+{
+	int accept_sock;
+	fd_set rfds, wfds;
+	struct session sessions[FD_SETSIZE];
+	int i, max_fd, r, sock;
+	BIO *sbio;
+	struct sockaddr_in sa_in;
+	socklen_t sa_len = sizeof(sa_in);
+
+
+	if (!strchr(proxy, ':')) {
+		fprintf(stderr, "Could not read port from proxy address\n");
+		exit(EXIT_FAILURE);
+	}
+	sa_in.sin_family = AF_INET;
+	sa_in.sin_port = htons(atoi(strchr(proxy, ':')+1));
+	*strchr(proxy, ':') = 0;
+	if (inet_pton(AF_INET, proxy, (void *)&sa_in.sin_addr.s_addr) <= 0) {
+		perror("inet_pton()");
+		exit(EXIT_FAILURE);
+	}
+
+	memset(&sessions, 0, sizeof(sessions));
+	BIO_get_fd(acpt, &accept_sock);
+	for (;;) {
+		FD_ZERO(&rfds);
+		FD_ZERO(&wfds);
+		FD_SET(accept_sock, &rfds);
+
+		max_fd = accept_sock;
+		for (i = 0; i < FD_SETSIZE; i++) {
+			if (sessions[i].sbio) {
+				FD_SET(i, &rfds);
+				if (sessions[i].to_bio)
+					FD_SET(i, &wfds);
+				FD_SET(sessions[i].remote, &rfds);
+				if (sessions[i].to_remote)
+					FD_SET(sessions[i].remote, &wfds);
+				if (i > max_fd)
+					max_fd = i;
+				if (sessions[i].remote > max_fd)
+					max_fd = sessions[i].remote;
+			}
+		}
+		max_fd += 1;
+		r = select(max_fd, &rfds, &wfds, NULL, NULL);
+		if (r == -1)
+			perror("select()");
+
+		while (FD_ISSET(accept_sock, &rfds)) {
+			if(BIO_do_accept(acpt) <= 0) {
+			       fprintf(stderr, "Error in connection\n");
+			       ERR_print_errors_fp(stderr);
+			       break;
+			}
+
+			sbio = BIO_pop(acpt);
+
+			if(BIO_do_handshake(sbio) <= 0) {
+			       fprintf(stderr, "Error in SSL handshake\n");
+			       ERR_print_errors_fp(stderr);
+			       break;
+			}
+
+			BIO_get_fd(sbio, &sock);
+			sessions[sock].sbio = sbio;
+			sessions[sock].remote = socket(AF_INET, SOCK_STREAM, 0);
+			if (connect(sessions[sock].remote,
+			    (struct sockaddr*)&sa_in, sa_len) < 0) {
+				perror("connect()");
+			}
+			break;
+		}
+	}
+}
 
 /*
  * main(): DANE chainserver program
@@ -540,14 +637,10 @@ int main(int argc, char **argv)
 	   return 0;
     }
 
-    /* Now wait for incoming connection */
-    if(BIO_do_accept(acpt) <= 0) {
-	   fprintf(stderr, "Error in connection\n");
-	   ERR_print_errors_fp(stderr);
-	   return 0;
-    }
+    if (proxy)
+	    do_proxy(acpt);
 
-    for (;;) {
+    else for (;;) {
 	/* Now wait for incoming connection */
 	if(BIO_do_accept(acpt) <= 0) {
 	       fprintf(stderr, "Error in connection\n");
