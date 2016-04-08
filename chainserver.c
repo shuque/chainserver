@@ -56,6 +56,7 @@ enum AUTH_MODE {
 
 int debug = 0;
 uint16_t port;
+char *port_str;
 enum AUTH_MODE auth_mode = MODE_BOTH;
 char *service_name = NULL;
 
@@ -66,6 +67,7 @@ char *CAfile = NULL;
 int clientauth = 0;
 int dnssec_chain = 1;
 unsigned char *dnssec_chain_data = NULL;
+char *proxy = NULL;
 
 #define UNUSED_PARAM(x) ((void) (x))
 
@@ -84,6 +86,7 @@ void print_usage(const char *progname)
 	    "       -key <file>:      server private key file\n"
 	    "       -clientauth:      require client authentication\n"
 	    "       -CAfile <file>:   CA file for client authentication\n"
+	    "       -proxy <ip>:<port>: IPv4 address and port to forward to\n"
 	    "\n",
 	    progname);
     exit(1);
@@ -133,6 +136,12 @@ void parse_options(const char *progname, int argc, char **argv)
 	    CAfile = argv[i];
 	} else if (!strcmp(optword, "-clientauth")) {
 	    clientauth = 1;
+	} else if (!strcmp(optword, "-proxy")) {
+	    if (++i >= argc || !*argv[i]) {
+		fprintf(stderr, "-proxy: proxy address and port expected.\n");
+		print_usage(progname);
+	    }
+	    proxy = argv[i];
 	} else if (optword[0] == '-') {
 	    fprintf(stderr, "Unrecognized option: %s\n", optword);
 	    print_usage(progname);
@@ -150,6 +159,7 @@ void parse_options(const char *progname, int argc, char **argv)
 	print_usage(progname);
     }
 
+    port_str = optword;
     port = atoi(optword);
 
     if (!server_name) {
@@ -397,19 +407,16 @@ int do_http(BIO *sbio)
     int seen_get_request = 0;
 
     /* read request */
-    while (1) {
-	readn = BIO_read(sbio, buffer, MYBUFSIZE);
-	if (readn == 0)
-	    break;
-	buffer[readn] = '\0';
-	if (debug) {
-	    fprintf(stdout, "recv: %s\n", buffer);
-	}
-	if (strncmp("GET ", buffer, 4) == 0) {
-	    seen_get_request = 1;
-	}
-    }
+    if ((readn = BIO_read(sbio, buffer, MYBUFSIZE)) <= 0)
+	return 0;
 
+    buffer[readn] = '\0';
+    if (debug) {
+	fprintf(stdout, "recv: (%d) %s\n", readn, buffer);
+    }
+    if (strncmp("GET ", buffer, 4) == 0) {
+	seen_get_request = 1;
+    }
     if (!seen_get_request) {
 	fprintf(stdout, "Did not see HTTP request from client.\n");
 	return 0;
@@ -428,6 +435,208 @@ int do_http(BIO *sbio)
     return 1;
 }
 
+struct chunk {
+	struct chunk *next;
+	size_t        size;
+	uint8_t       data[];
+};
+
+struct session {
+	BIO *sbio;
+	int remote;
+	struct chunk *to_bio;
+	struct chunk *to_remote;
+};
+static void free_chunks(struct chunk *c)
+{
+	if (c) {
+		free_chunks(c->next);
+		free(c);
+	}
+}
+
+static void do_bio_read(struct session *s)
+{
+	uint8_t buf[65536];
+	ssize_t len = BIO_read(s->sbio, buf, sizeof(buf));
+	struct chunk **chunk_p;
+
+	if (len == 0) {
+		/* close */
+		free_chunks(s->to_remote);
+		free_chunks(s->to_bio);
+		s->to_remote = s->to_bio = NULL;
+		BIO_free_all(s->sbio);
+		s->sbio = NULL;
+		close(s->remote);
+		s->remote = -1;
+		return;
+	}
+	if (len < 0) /* error */
+		return;
+
+	/* Append a new chunk */
+	for (chunk_p = &s->to_remote; *chunk_p; chunk_p = &(*chunk_p)->next)
+		; /* pass */
+
+	*chunk_p = (struct chunk *)malloc(sizeof(struct chunk) + len);
+	(*chunk_p)->next = NULL;
+	(*chunk_p)->size = len;
+	memcpy((*chunk_p)->data, buf, len);
+}
+
+static void do_bio_write(struct session *s)
+{
+	struct chunk *c = s->to_bio;
+	if (!c)
+		return;
+
+	s->to_bio = c->next;
+	BIO_write(s->sbio, c->data, c->size);
+	free(c);
+}
+
+static void do_remote_read(struct session *s)
+{
+	uint8_t buf[65536];
+	ssize_t len = read(s->remote, buf, sizeof(buf));
+	struct chunk **chunk_p;
+	SSL *ssl;
+	int sock;
+
+	if (len == 0) {
+		/* close */
+		free_chunks(s->to_remote);
+		free_chunks(s->to_bio);
+		s->to_remote = s->to_bio = NULL;
+		BIO_get_ssl(s->sbio, &ssl);
+		SSL_shutdown(ssl);
+		BIO_get_fd(s->sbio, &sock);
+		close(sock);
+		BIO_free_all(s->sbio);
+		s->sbio = NULL;
+		s->remote = -1;
+		return;
+	}
+	if (len < 0) /* error */ {
+		perror("read()");
+		return;
+	}
+
+	/* Append a new chunk */
+	for (chunk_p = &s->to_bio; *chunk_p; chunk_p = &(*chunk_p)->next)
+		; /* pass */
+
+	*chunk_p = (struct chunk *)malloc(sizeof(struct chunk) + len);
+	(*chunk_p)->next = NULL;
+	(*chunk_p)->size = len;
+	memcpy((*chunk_p)->data, buf, len);
+}
+
+static void do_remote_write(struct session *s)
+{
+	struct chunk *c = s->to_remote;
+	if (!c)
+		return;
+
+	s->to_remote = c->next;
+	write(s->remote, c->data, c->size);
+	free(c);
+}
+
+static void do_proxy(BIO *acpt)
+{
+	int accept_sock;
+	fd_set rfds, wfds;
+	struct session sessions[FD_SETSIZE];
+	int i, max_fd, r, sock;
+	BIO *sbio;
+	struct sockaddr_in sa_in;
+	socklen_t sa_len = sizeof(sa_in);
+
+
+	if (!strchr(proxy, ':')) {
+		fprintf(stderr, "Could not read port from proxy address\n");
+		exit(EXIT_FAILURE);
+	}
+	sa_in.sin_family = AF_INET;
+	sa_in.sin_port = htons(atoi(strchr(proxy, ':')+1));
+	*strchr(proxy, ':') = 0;
+	if (inet_pton(AF_INET, proxy, (void *)&sa_in.sin_addr.s_addr) <= 0) {
+		perror("inet_pton()");
+		exit(EXIT_FAILURE);
+	}
+
+	memset(&sessions, 0, sizeof(sessions));
+	BIO_get_fd(acpt, &accept_sock);
+	for (;;) {
+		FD_ZERO(&rfds);
+		FD_ZERO(&wfds);
+		FD_SET(accept_sock, &rfds);
+
+		max_fd = accept_sock;
+		for (i = 0; i < FD_SETSIZE; i++) {
+			if (!sessions[i].sbio)
+				continue;
+			FD_SET(i, &rfds);
+			if (sessions[i].to_bio)
+				FD_SET(i, &wfds);
+			FD_SET(sessions[i].remote, &rfds);
+			if (sessions[i].to_remote)
+				FD_SET(sessions[i].remote, &wfds);
+			if (i > max_fd)
+				max_fd = i;
+			if (sessions[i].remote > max_fd)
+				max_fd = sessions[i].remote;
+		}
+		max_fd += 1;
+		r = select(max_fd, &rfds, &wfds, NULL, NULL);
+		if (r == -1)
+			perror("select()");
+
+		while (FD_ISSET(accept_sock, &rfds)) {
+			if(BIO_do_accept(acpt) <= 0) {
+			       fprintf(stderr, "Error in connection\n");
+			       ERR_print_errors_fp(stderr);
+			       break;
+			}
+
+			sbio = BIO_pop(acpt);
+
+			if(BIO_do_handshake(sbio) <= 0) {
+			       fprintf(stderr, "Error in SSL handshake\n");
+			       ERR_print_errors_fp(stderr);
+			       break;
+			}
+
+			BIO_get_fd(sbio, &sock);
+			sessions[sock].sbio = sbio;
+			sessions[sock].remote = socket(AF_INET, SOCK_STREAM, 0);
+			if (connect(sessions[sock].remote,
+			    (struct sockaddr*)&sa_in, sa_len) < 0) {
+				perror("connect()");
+			}
+			break;
+		}
+		for (i = 0; i < FD_SETSIZE; i++) {
+			if (!sessions[i].sbio)
+				continue;
+
+			if (FD_ISSET(i, &wfds)) {
+				do_bio_write(&sessions[i]);
+			}
+			if (FD_ISSET(sessions[i].remote, &wfds)) {
+				do_remote_write(&sessions[i]);
+			}
+			if (FD_ISSET(i, &rfds)) {
+				do_bio_read(&sessions[i]);
+			}
+			if (FD_ISSET(sessions[i].remote, &rfds)) {
+				do_remote_read(&sessions[i]);
+			}
+		}
+	}
+}
 
 /*
  * main(): DANE chainserver program
@@ -437,7 +646,6 @@ int main(int argc, char **argv)
 {
 
     const char *progname;
-    char ipstring[INET6_ADDRSTRLEN];
     char tlsa_name[512];
     getdns_bindata *chaindata = NULL;
     int return_status = 1;                    /* program return status */
@@ -446,7 +654,7 @@ int main(int argc, char **argv)
     SSL *ssl = NULL;
     const SSL_CIPHER *cipher = NULL;
     X509_VERIFY_PARAM *vpm = NULL;
-    BIO *sbio;
+    BIO *sbio, *acpt;
 
     /* uint8_t usage, selector, mtype; */
 
@@ -530,120 +738,66 @@ int main(int argc, char **argv)
     const unsigned char *sid_ctx = (const unsigned char *) "chainserver";
     (void) SSL_CTX_set_session_id_context(ctx, sid_ctx, sizeof(sid_ctx));
 
-    /*
-     * Setup listening socket
+    
+    /* New SSL BIO setup as server */
+    sbio = BIO_new_ssl(ctx,0);
+
+    BIO_get_ssl(sbio, &ssl);
+    if(!ssl) {
+        fprintf(stderr, "Can't locate SSL pointer\n");
+        /* whatever ... */
+    }
+
+    /* Don't want any retries */
+    SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
+
+    acpt = BIO_new_accept(port_str);
+
+    /* By doing this when a new connection is established
+     * we automatically have sbio inserted into it. The
+     * BIO chain is now 'swallowed' by the accept BIO and
+     * will be freed when the accept BIO is freed.
      */
 
-    struct sockaddr_in serv_addr, cli_addr;
-    socklen_t cli_addr_len = sizeof(struct sockaddr_in);
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    memset(&cli_addr, 0, sizeof(cli_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons((uint16_t) port);
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
+    BIO_set_accept_bios(acpt,sbio);
 
-    /* Setup SIGCHLD handler to reap child processes */
-    struct sigaction sa;
-    sa.sa_handler = &sig_chld;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-	perror("sigaction");
-	goto cleanup;
+    /* Setup accept BIO */
+    if(BIO_do_accept(acpt) <= 0) {
+	   fprintf(stderr, "Error setting up accept BIO\n");
+	   ERR_print_errors_fp(stderr);
+	   return 0;
     }
 
-    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == -1) {
-	perror("socket");
-	goto cleanup;
-    }
+    if (proxy)
+	    do_proxy(acpt);
 
-    int j = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *) &j, sizeof j);
-    if (bind(sock, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) == -1) {
-	perror("bind");
-	fprintf(stderr, "Unable to bind to server address.\n");
-	goto cleanup;
-    }
-
-    if (listen(sock, 5) == -1) {
-	perror("listen");
-	close(sock);
-	goto cleanup;
-    }
-    fprintf(stdout, "Chain Server listening on port %d\n", port);
-
-    int clisock;
-
-    while (1) {
-
-	pid_t pid;
-	if ((clisock = accept(sock, (struct sockaddr *) &cli_addr, 
-			      &cli_addr_len)) < 0) {
-	    perror("accept");
-	    fprintf(stderr, "Error accepting client socket.\n");
-	    goto cleanup;
+    else for (;;) {
+	/* Now wait for incoming connection */
+	if(BIO_do_accept(acpt) <= 0) {
+	       fprintf(stderr, "Error in connection\n");
+	       ERR_print_errors_fp(stderr);
+	       return 0;
 	}
 
-	if ((pid = fork()) == -1) {
-	    perror("fork");
-	    fprintf(stderr, "Error: fork() failed.\n");
-	    /* should we abort here instead? */
-	    close(clisock);
-	    continue;
-	} else if (pid != 0) {
-	    /* parent process */
-	    close(clisock);
-	    continue;
+	sbio = BIO_pop(acpt);
+
+	if(BIO_do_handshake(sbio) <= 0) {
+	       fprintf(stderr, "Error in SSL handshake\n");
+	       ERR_print_errors_fp(stderr);
+	       return 0;
 	}
-
-	/* child process */
-	inet_ntop(AF_INET, &cli_addr.sin_addr, ipstring, sizeof ipstring);
-	fprintf(stdout, "Connection from %s port=%d\n", 
-		ipstring, cli_addr.sin_port);
-
-	ssl = SSL_new(ctx);
-	if (! ssl) {
-	    fprintf(stderr, "SSL_new() failed.\n");
-	    ERR_print_errors_fp(stderr);
-	    close(sock);
-	    continue;
-	}
-
-	/* No partial label wildcards */
-	SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-
-	/* Set connect mode (client) and tie socket to TLS context */
-	sbio = BIO_new_socket(clisock, BIO_NOCLOSE);
-	SSL_set_bio(ssl, sbio, sbio);
-
-	/* Perform TLS connection handshake */
-	if (SSL_accept(ssl) <= 0) {
-	    fprintf(stderr, "TLS connection failed.\n");
-	    ERR_print_errors_fp(stderr);
-	    SSL_free(ssl);
-	    close(sock);
-	    continue;
-	}
+	BIO_get_ssl(sbio, ssl);
 
 	cipher = SSL_get_current_cipher(ssl);
 	fprintf(stdout, "%s Cipher: %s %s\n\n", SSL_get_version(ssl),
 		SSL_CIPHER_get_version(cipher), SSL_CIPHER_get_name(cipher));
 
-	/* TODO: read HTTP request and spit out a response */
-#if 0
 	do_http(sbio);
-#endif
-	sleep(2);
-
-	/* Shutdown */
 	SSL_shutdown(ssl);
-	SSL_free(ssl);
-	close(clisock);
-	return return_status;
+	BIO_get_fd(sbio, &sock);
+	close(sock);
+    	BIO_free_all(sbio);
     }
-
-    close(sock);
 
 cleanup:
     free(dnssec_chain_data);
@@ -651,6 +805,5 @@ cleanup:
 	X509_VERIFY_PARAM_free(vpm);
 	SSL_CTX_free(ctx);
     }
-
     return return_status;
 }

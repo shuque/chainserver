@@ -19,7 +19,6 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
-#include <ldns/ldns.h>
 
 #include <getdns/getdns.h>
 #include <getdns/getdns_extra.h>
@@ -30,7 +29,6 @@
 #include <openssl/x509v3.h>
 
 #include "utils.h"
-#include "query-ldns.h"
 #include "starttls.h"
 
 
@@ -59,8 +57,6 @@ char *service_name = NULL;
 #define DNSSEC_CHAIN_EXT_TYPE 53
 
 int dnssec_chain = 1;
-unsigned char *dnssec_chain_data = NULL;
-
 
 /*
  * usage(): Print usage string and exit.
@@ -238,9 +234,6 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     UNUSED_PARAM(al);
     UNUSED_PARAM(arg);
 
-    dnssec_chain_data = (unsigned char *) malloc(ext_len);
-    memcpy(dnssec_chain_data, ext_data, ext_len);
-
     if (debug) {
 	fprintf(stdout, "Received DNSSEC chain extension (%d).\n"
 		"Extension data length = %zu octets.\n", ext_type, ext_len);
@@ -250,7 +243,7 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     i = n_rrs = 0;
     buf_len = ext_len;
     while (buf_len > 0) {
-	rc = getdns_wire2rr_dict_scan(&dnssec_chain_data, &buf_len, &rr_dict);
+	rc = getdns_wire2rr_dict_scan(&ext_data, &buf_len, &rr_dict);
 	if (rc)
 	    break;
 	if ((rc = getdns_dict_get_bindata(rr_dict, "/name", &rrname))) {
@@ -287,8 +280,6 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
     if (!(trust_anchors = getdns_root_trust_anchor(NULL)))
 	fprintf(stderr, "Could not read trust anchor\n");
     else {
-    	fprintf(stderr, "%s\n", getdns_pretty_print_list(trust_anchors));
-
 	dnssec_status = getdns_validate_dnssec(
 		to_validate_rrs, support_rrs, trust_anchors);
 	fprintf(stdout, "dnssec status: %s\n",
@@ -347,7 +338,8 @@ static int dnssec_chain_parse_cb(SSL *ssl, unsigned int ext_type,
 int main(int argc, char **argv)
 {
 
-    const char *progname, *hostname, *port;
+    const char *progname, *port;
+    char *hostname;
     struct addrinfo gai_hints;
     struct addrinfo *gai_result = NULL, *gaip;
     char ipstring[INET6_ADDRSTRLEN], *cp;
@@ -577,30 +569,30 @@ int main(int argc, char **argv)
 	    ERR_print_errors_fp(stderr);
 	}
 
-#if 0
+#if 1
+	int readn;
+	char buffer[MYBUFSIZE];
+
 	/* This doesn't work yet */
 	/* Do minimal HTTP 1.0 conversation*/
-	BIO *fbio = BIO_new(BIO_f_buffer());
-	BIO_push(fbio, sbio);
 
-	BIO_printf(fbio, "GET / HTTP/1.0\r\n\r\n");
+	snprintf( buffer, sizeof(buffer)
+	        , "GET / HTTP/1.0\r\nHost: %s\r\n\r\n"
+	        , hostname
+		);
+	SSL_write(ssl, buffer, strlen(buffer));
 	while (1) {
-	    fprintf(stdout, "about to read() ..\n");
-	    readn = BIO_gets(fbio, buffer, MYBUFSIZE);
-	    fprintf(stdout, "read %d octets ..\n", readn);
+	    if (debug)
+	    	fprintf(stdout, "about to read() ..\n");
+	    readn = SSL_read(ssl, buffer, MYBUFSIZE);
+	    if (debug)
+	    	fprintf(stdout, "read %d octets ..\n", readn);
 	    if (readn == 0)
 		break;
 	    buffer[readn] = '\0';
-	    if (debug) {
-		fprintf(stdout, "recv: %s\n", buffer);
-	    }
+	    fprintf(stdout, "%s", buffer);
 	}
-	BIO_pop(fbio);
-	BIO_free(fbio);
 #endif
-
-	sleep(1);
-
 	/* Shutdown */
 	SSL_shutdown(ssl);
 	SSL_free(ssl);

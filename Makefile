@@ -12,9 +12,9 @@ PROG    = chainclient chainserver getchain
 
 INCLUDE = -I. -I/usr/local/openssl/include -I/usr/local/getdns/include
 CFLAGS  = -g -Wall -Wextra $(INCLUDE)
-LDFLAGS = -L/usr/local/openssl/lib -L/usr/local/getdns/lib -Wl,-rpath -Wl,/usr/local/openssl/lib -Wl,-rpath -Wl,/usr/local/getdns/lib
-LIBS_LDNS    = -lssl -lcrypto -lldns
-LIBS_GETDNS  = -lssl -lcrypto -lldns -lgetdns_ext_event -lgetdns -levent_core -lunbound -lidn
+LDFLAGS = -L/usr/local/openssl/lib -L/usr/local/lib -Wl,-rpath -Wl,/usr/local/openssl/lib -Wl,-rpath -Wl,/usr/local/lib
+LIBS_LDNS    = -lssl -lcrypto -lldns -ldl -lpthread
+LIBS_GETDNS  = -lssl -lcrypto -lldns -lgetdns_ext_event -lgetdns -levent_core -lunbound -lidn -ldl
 CC      = cc
 
 # For Mac OS X

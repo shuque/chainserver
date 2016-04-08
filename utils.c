@@ -9,7 +9,7 @@
  * Caller needs to free returned memory.
  */
 
-char *bin2hexstring(uint8_t *data, size_t length)
+char *bin2hexstring(const uint8_t *data, size_t length)
 {
     size_t k;
     char *outstring, *p;
